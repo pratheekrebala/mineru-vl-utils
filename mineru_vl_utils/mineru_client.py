@@ -1060,6 +1060,7 @@ class MinerUClient:
             async def aio_batch_predict_fn(prompts: list[str]) -> list[str]:
                 return await self.client.aio_batch_predict(
                     [None] * len(prompts), prompts, [params] * len(prompts),
+                    semaphore=semaphore,
                 )
 
             await aio_detect_cross_page_cell_merge(results, aio_batch_predict_fn)
@@ -1162,6 +1163,7 @@ class MinerUClient:
             async def aio_batch_predict_fn(prompts: list[str]) -> list[str]:
                 return await self.client.aio_batch_predict(
                     [None] * len(prompts), prompts, [params] * len(prompts),
+                    semaphore=semaphore,
                 )
 
             await aio_detect_cross_page_cell_merge(results, aio_batch_predict_fn)
@@ -1415,6 +1417,7 @@ class MinerUClient:
             async def aio_batch_predict_fn(prompts: list[str]) -> list[str]:
                 return await self.client.aio_batch_predict(
                     [None] * len(prompts), prompts, [params] * len(prompts),
+                    semaphore=semaphore,
                 )
 
             await aio_detect_cross_page_cell_merge(results, aio_batch_predict_fn)
