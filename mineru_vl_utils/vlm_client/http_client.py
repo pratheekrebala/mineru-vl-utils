@@ -3,7 +3,7 @@ import json
 import os
 import re
 from enum import Enum
-from typing import AsyncIterable, Iterable, Sequence
+from typing import Any, AsyncIterable, Iterable, Sequence
 
 import httpx
 from httpx_retries import Retry, RetryTransport
@@ -62,6 +62,7 @@ class HttpVlmClient(VlmClient):
         max_connections: int | None = None,
         max_keepalive_connections: int | None = 20,
         keepalive_expiry: float | None = 5,
+        http_batch_size: int = 0,
         debug: bool = False,
         max_retries: int = 3,
         retry_backoff_factor: float = 0.5,
@@ -100,6 +101,7 @@ class HttpVlmClient(VlmClient):
         self.max_connections = max_connections
         self.max_keepalive_connections = max_keepalive_connections
         self.keepalive_expiry = keepalive_expiry
+        self.http_batch_size = int(os.getenv("MINERU_VL_HTTP_BATCH_SIZE", str(http_batch_size or 0)) or 0)
         self.max_retries = max_retries
         self.retry_backoff_factor = retry_backoff_factor
 
@@ -118,6 +120,10 @@ class HttpVlmClient(VlmClient):
     @property
     def chat_url(self) -> str:
         return f"{self.server_url}/v1/chat/completions"
+
+    @property
+    def chat_batch_url(self) -> str:
+        return f"{self.server_url}/v1/chat/completions/batch"
 
     def _new_client(self) -> httpx.Client:
         return httpx.Client(
@@ -340,6 +346,123 @@ class HttpVlmClient(VlmClient):
             content = content[: -len(end_token)]
         return content or ""
 
+    def get_batch_response_contents(self, response_data: dict, expected_count: int) -> list[str]:
+        if response_data.get("object") == "error":
+            raise ServerError(f"Error from server: {response_data}")
+        choices = response_data.get("choices")
+        if not isinstance(choices, list):
+            raise ServerError("Choices not found in the batch response.")
+        if len(choices) != expected_count:
+            raise ServerError(f"Expected {expected_count} choices in batch response, got {len(choices)}.")
+
+        contents: list[str | None] = [None] * expected_count
+        for fallback_idx, choice in enumerate(choices):
+            if not isinstance(choice, dict):
+                raise ServerError(f"Unexpected choice type in batch response: {type(choice)}.")
+            idx = choice.get("index", fallback_idx)
+            if not isinstance(idx, int) or idx < 0 or idx >= expected_count:
+                raise ServerError(f"Invalid choice index in batch response: {idx}")
+            contents[idx] = self.get_response_content({"choices": [choice]})
+
+        missing_indices = [idx for idx, content in enumerate(contents) if content is None]
+        if missing_indices:
+            raise ServerError(f"Missing choices in batch response for indices: {missing_indices}")
+        return [content or "" for content in contents]
+
+    @staticmethod
+    def _batch_group_key(request_body: dict[str, Any]) -> str:
+        batch_shared_body = {key: value for key, value in request_body.items() if key != "messages"}
+        return json.dumps(batch_shared_body, sort_keys=True, ensure_ascii=False)
+
+    def _build_batch_request_body(self, request_bodies: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        if not request_bodies:
+            raise RequestError("Cannot build an empty batch request.")
+        batch_body = {key: value for key, value in request_bodies[0].items() if key != "messages"}
+        batch_body["messages"] = [body["messages"] for body in request_bodies]
+        return batch_body
+
+    async def _aio_predict_batch_chunk(self, request_bodies: Sequence[dict[str, Any]]) -> list[str]:
+        request_body = self._build_batch_request_body(request_bodies)
+
+        if self.debug:
+            request_text = json.dumps(request_body, ensure_ascii=False)
+            if len(request_text) > 4096:
+                request_text = request_text[:2048] + "...(truncated)..." + request_text[-2048:]
+            logger.debug("Batch request body: {}", request_text)
+
+        client = await self._aio_client()
+        response = await client.post(self.chat_batch_url, json=request_body)
+        if response.status_code in {404, 405}:
+            raise RequestError(
+                f"Batch endpoint is not supported by server {self.server_url}. "
+                "Disable MINERU_VL_HTTP_BATCH_SIZE or use a vLLM server with /v1/chat/completions/batch."
+            )
+        response_data = self.get_response_data(response)
+
+        if self.debug:
+            logger.debug("Batch response status code: {}", response.status_code)
+            logger.debug("Batch response body: {}", response.text)
+
+        return self.get_batch_response_contents(response_data, len(request_bodies))
+
+    async def _aio_batch_predict_vllm_batch_endpoint(
+        self,
+        images: Sequence[ImageType],
+        prompts: Sequence[str],
+        sampling_params: Sequence[SamplingParams | None],
+        priority: Sequence[int | None],
+        semaphore: asyncio.Semaphore,
+        use_tqdm: bool = False,
+        tqdm_desc: str | None = None,
+    ) -> list[str]:
+        prepared_images = await gather_tasks(
+            tasks=[aio_image_to_bytes_list_and_format(image) for image in images],
+            use_tqdm=use_tqdm,
+            tqdm_desc=f"{tqdm_desc or 'Prediction'} Preparation",
+        )
+        request_bodies = [
+            self.build_request_body(
+                system_prompt=self.system_prompt,
+                image=image_bytes,
+                prompt=prompt,
+                sampling_params=params,
+                image_format=image_format,
+                priority=prio,
+            )
+            for (image_bytes, image_format), prompt, params, prio in zip(
+                prepared_images,
+                prompts,
+                sampling_params,
+                priority,
+            )
+        ]
+
+        indexed_outputs: list[str | None] = [None] * len(request_bodies)
+        grouped_indices: dict[str, list[int]] = {}
+        for idx, request_body in enumerate(request_bodies):
+            grouped_indices.setdefault(self._batch_group_key(request_body), []).append(idx)
+
+        async def predict_chunk(chunk_indices: list[int]) -> tuple[list[int], list[str]]:
+            async with semaphore:
+                chunk_bodies = [request_bodies[idx] for idx in chunk_indices]
+                return chunk_indices, await self._aio_predict_batch_chunk(chunk_bodies)
+
+        tasks = []
+        batch_size = max(1, self.http_batch_size)
+        for indices in grouped_indices.values():
+            for start in range(0, len(indices), batch_size):
+                tasks.append(predict_chunk(indices[start : start + batch_size]))
+
+        chunk_results = await gather_tasks(tasks=tasks, use_tqdm=use_tqdm, tqdm_desc=tqdm_desc)
+        for chunk_indices, chunk_outputs in chunk_results:
+            for idx, output in zip(chunk_indices, chunk_outputs):
+                indexed_outputs[idx] = output
+
+        missing_indices = [idx for idx, output in enumerate(indexed_outputs) if output is None]
+        if missing_indices:
+            raise ServerError(f"Missing batch outputs for indices: {missing_indices}")
+        return [output or "" for output in indexed_outputs]
+
     def predict(
         self,
         image: ImageType,
@@ -514,6 +637,17 @@ class HttpVlmClient(VlmClient):
 
         if semaphore is None:
             semaphore = asyncio.Semaphore(self.max_concurrency)
+
+        if self.http_batch_size > 1:
+            return await self._aio_batch_predict_vllm_batch_endpoint(
+                images=images,
+                prompts=prompts,
+                sampling_params=sampling_params,
+                priority=priority,
+                semaphore=semaphore,
+                use_tqdm=use_tqdm,
+                tqdm_desc=tqdm_desc,
+            )
 
         async def predict_with_semaphore(
             image: ImageType,
