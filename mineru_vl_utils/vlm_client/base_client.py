@@ -1,5 +1,6 @@
 import asyncio
 import math
+from concurrent.futures import Executor
 from dataclasses import dataclass
 from typing import Literal, Sequence, TypeAlias
 
@@ -293,6 +294,7 @@ def new_vlm_client(
     max_retries: int = 3,
     retry_backoff_factor: float = 0.5,
     skip_model_name_checking: bool = False,
+    executor: Executor | None = None,
 ) -> VlmClient:
     if backend == "http-client":
         from .http_client import HttpVlmClient
@@ -391,6 +393,7 @@ def new_vlm_client(
             allow_truncated_content=allow_truncated_content,
             max_concurrency=max_concurrency,
             debug=debug,
+            executor=executor,
         )
 
     else:

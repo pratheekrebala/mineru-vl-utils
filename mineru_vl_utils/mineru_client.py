@@ -2,7 +2,7 @@ import asyncio
 import math
 import os
 import re
-from concurrent.futures import Executor
+from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import nullcontext
 from typing import Any, Callable, Literal, Sequence, TypeVar
 
@@ -88,6 +88,21 @@ INTERNAL_BLOCK_THRESHOLD = 0.9
 IMAGE_ANALYSIS_MIN_BLOCK_SIZE = 0.1
 IMAGE_ANALYSIS_MIN_BLOCK_AREA = 0.01
 _ExecutorResult = TypeVar("_ExecutorResult")
+
+
+def _read_positive_int_env(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Invalid {} value: {!r}; ignoring", name, value)
+        return None
+    if parsed <= 0:
+        logger.warning("Invalid {} value: {!r}; expected a positive integer", name, value)
+        return None
+    return parsed
 
 
 async def _run_in_executor_drained(
@@ -611,6 +626,13 @@ class MinerUClient:
 
                 vllm_async_llm = AsyncLLM.from_engine_args(AsyncEngineArgs(model_path))
 
+        owned_executor = None
+        if executor is None:
+            cpu_workers = _read_positive_int_env("MINERU_VL_CPU_WORKERS")
+            if cpu_workers is not None:
+                owned_executor = ThreadPoolExecutor(max_workers=cpu_workers, thread_name_prefix="mineru-vl")
+                executor = owned_executor
+
         self.client = new_vlm_client(
             backend=backend,
             model_name=model_name,
@@ -635,6 +657,7 @@ class MinerUClient:
             max_retries=max_retries,
             retry_backoff_factor=retry_backoff_factor,
             skip_model_name_checking=skip_model_name_checking,
+            executor=executor,
         )
         self.helper = MinerUClientHelper(
             backend=backend,
@@ -659,6 +682,7 @@ class MinerUClient:
         self.incremental_priority = incremental_priority
         self.max_concurrency = max_concurrency
         self.executor = executor
+        self._owned_executor = owned_executor
         self.use_tqdm = use_tqdm
         self.debug = debug
         self.scored = scored
@@ -667,6 +691,12 @@ class MinerUClient:
             self.batching_mode = "concurrent"
         else:  # backend in ("transformers", "vllm-engine")
             self.batching_mode = "stepping"
+
+    def shutdown(self) -> None:
+        owned_executor = getattr(self, "_owned_executor", None)
+        if owned_executor is not None:
+            owned_executor.shutdown(wait=False, cancel_futures=True)
+            self._owned_executor = None
 
     # ------------------------------------------------------------------
     # Internal helpers: normalize predict / predict_scored into _PredictResult

@@ -1,5 +1,7 @@
 import asyncio
 import uuid
+from concurrent.futures import Executor
+from functools import partial
 from typing import TYPE_CHECKING, Any, Sequence
 
 from loguru import logger
@@ -19,7 +21,7 @@ from .base_client import (
     VlmClient,
     compute_confidence_metrics,
 )
-from .utils import aio_image_to_obj_list, gather_tasks
+from .utils import gather_tasks, image_to_obj_list
 from .vllm_engine_client import _build_raw_vllm_prompt, _patch_vllm_logprobs_overflow
 
 _patch_vllm_logprobs_overflow()
@@ -36,6 +38,7 @@ class VllmAsyncEngineVlmClient(VlmClient):
         allow_truncated_content: bool = False,
         max_concurrency: int = 100,
         debug: bool = False,
+        executor: Executor | None = None,
     ):
         super().__init__(
             prompt=prompt,
@@ -71,6 +74,7 @@ class VllmAsyncEngineVlmClient(VlmClient):
         self.VllmRequestOutputKind = RequestOutputKind
         self.max_concurrency = max_concurrency
         self.debug = debug
+        self.executor = executor
 
     def build_messages(self, prompt: str, num_images: int) -> list[dict]:
         prompt = prompt or self.prompt
@@ -145,22 +149,100 @@ class VllmAsyncEngineVlmClient(VlmClient):
 
         return choices[0].text
 
-    async def _render_vllm_cmpl_input(self, raw_prompt: dict[str, Any]) -> dict[str, Any]:
-        """优先使用新版 vLLM Renderer 异步预处理 prompt，旧版无 renderer 时保持原输入。"""
+    async def _run_sync(self, fn, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        if kwargs:
+            fn = partial(fn, **kwargs)
+        return await loop.run_in_executor(self.executor, fn, *args)
+
+    def _prepare_generate_request_sync(
+        self,
+        image: ImageType,
+        prompt: str,
+        sampling_params: SamplingParams | None,
+        priority: int | None,
+        *,
+        logprobs: bool = False,
+    ) -> tuple[dict[str, Any], Any, dict[str, Any]]:
+        image = image_to_obj_list(image)
+        chat_prompt: str = self.tokenizer.apply_chat_template(
+            self.build_messages(prompt, len(image)),
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        vllm_sp = self.build_vllm_sampling_params(sampling_params)
+        if logprobs:
+            vllm_sp.logprobs = 0
+        generate_kwargs = {}
+        if priority is not None:
+            generate_kwargs["priority"] = priority
+        return _build_raw_vllm_prompt(chat_prompt, image), vllm_sp, generate_kwargs
+
+    def _prepare_score_request_sync(
+        self,
+        image: ImageType,
+        scored_text: str,
+        prompt: str,
+        sampling_params: SamplingParams | None,
+        priority: int | None,
+    ) -> tuple[dict[str, Any], Any, dict[str, Any], int]:
+        image_list = image_to_obj_list(image)
+        full_prompt, scored_token_count = self._build_score_prompt_pair(prompt, len(image_list), scored_text)
+        vllm_sp = self.build_vllm_sampling_params(sampling_params)
+        vllm_sp.prompt_logprobs = 0
+        vllm_sp.max_tokens = 1
+        generate_kwargs = {}
+        if priority is not None:
+            generate_kwargs["priority"] = priority
+        return _build_raw_vllm_prompt(full_prompt, image_list), vllm_sp, generate_kwargs, scored_token_count
+
+    async def _render_vllm_cmpl_inputs(self, raw_prompts: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Use vLLM's renderer when available; older engines keep raw inputs."""
         renderer = getattr(self.vllm_async_llm, "renderer", None)
         if renderer is None:
-            return raw_prompt
+            return list(raw_prompts)
 
         render_cmpl_async = getattr(renderer, "render_cmpl_async", None)
         if callable(render_cmpl_async):
-            rendered_inputs = await render_cmpl_async([raw_prompt])
-            return rendered_inputs[0]
+            return list(await render_cmpl_async(list(raw_prompts)))
 
         render_cmpl = getattr(renderer, "render_cmpl", None)
         if callable(render_cmpl):
-            return render_cmpl([raw_prompt])[0]
+            return list(await self._run_sync(render_cmpl, list(raw_prompts)))
 
-        return raw_prompt
+        return list(raw_prompts)
+
+    async def _render_vllm_cmpl_input(self, raw_prompt: dict[str, Any]) -> dict[str, Any]:
+        return (await self._render_vllm_cmpl_inputs([raw_prompt]))[0]
+
+    async def _generate_output(
+        self,
+        vllm_prompt: dict[str, Any],
+        vllm_sp,
+        generate_kwargs: dict[str, Any],
+        semaphore: asyncio.Semaphore | None = None,
+    ) -> "RequestOutput":
+        last_output = None
+        if semaphore is None:
+            async for output in self.vllm_async_llm.generate(
+                prompt=vllm_prompt,
+                sampling_params=vllm_sp,
+                request_id=str(uuid.uuid4()),
+                **generate_kwargs,
+            ):
+                last_output = output
+        else:
+            async with semaphore:
+                async for output in self.vllm_async_llm.generate(
+                    prompt=vllm_prompt,
+                    sampling_params=vllm_sp,
+                    request_id=str(uuid.uuid4()),
+                    **generate_kwargs,
+                ):
+                    last_output = output
+        if last_output is None:
+            raise ServerError("No output from the server.")
+        return last_output
 
     def predict(
         self,
@@ -195,34 +277,15 @@ class VllmAsyncEngineVlmClient(VlmClient):
         sampling_params: SamplingParams | None = None,
         priority: int | None = None,
     ) -> str:
-        image = await aio_image_to_obj_list(image)
-
-        chat_prompt: str = self.tokenizer.apply_chat_template(
-            self.build_messages(prompt, len(image)),
-            tokenize=False,
-            add_generation_prompt=True,
+        raw_prompt, vllm_sp, generate_kwargs = await self._run_sync(
+            self._prepare_generate_request_sync,
+            image,
+            prompt,
+            sampling_params,
+            priority,
         )
-
-        vllm_sp = self.build_vllm_sampling_params(sampling_params)
-
-        generate_kwargs = {}
-        if priority is not None:
-            generate_kwargs["priority"] = priority
-
-        vllm_prompt = await self._render_vllm_cmpl_input(_build_raw_vllm_prompt(chat_prompt, image))
-
-        last_output = None
-        async for output in self.vllm_async_llm.generate(
-            prompt=vllm_prompt,
-            sampling_params=vllm_sp,
-            request_id=str(uuid.uuid4()),
-            **generate_kwargs,
-        ):
-            last_output = output
-
-        if last_output is None:  # this should not happen
-            raise ServerError("No output from the server.")
-
+        vllm_prompt = await self._render_vllm_cmpl_input(raw_prompt)
+        last_output = await self._generate_output(vllm_prompt, vllm_sp, generate_kwargs)
         return self.get_output_content(last_output)
 
     async def aio_batch_predict(
@@ -249,33 +312,24 @@ class VllmAsyncEngineVlmClient(VlmClient):
         if semaphore is None:
             semaphore = asyncio.Semaphore(self.max_concurrency)
 
-        async def predict_with_semaphore(
-            image: ImageType,
-            prompt: str,
-            sampling_params: SamplingParams | None,
-            priority: int | None,
-        ):
-            async with semaphore:
-                return await self.aio_predict(
-                    image=image,
-                    prompt=prompt,
-                    sampling_params=sampling_params,
-                    priority=priority,
-                )
-
-        return await gather_tasks(
+        prepared = await gather_tasks(
             tasks=[
-                predict_with_semaphore(*args)
-                for args in zip(
-                    images,
-                    prompts,
-                    sampling_params,
-                    priority,
-                )
+                self._run_sync(self._prepare_generate_request_sync, *args)
+                for args in zip(images, prompts, sampling_params, priority)
+            ],
+            use_tqdm=False,
+            tqdm_desc=None,
+        )
+        rendered_prompts = await self._render_vllm_cmpl_inputs([item[0] for item in prepared])
+        outputs = await gather_tasks(
+            tasks=[
+                self._generate_output(rendered_prompt, vllm_sp, generate_kwargs, semaphore)
+                for rendered_prompt, (_, vllm_sp, generate_kwargs) in zip(rendered_prompts, prepared)
             ],
             use_tqdm=use_tqdm,
             tqdm_desc=tqdm_desc,
         )
+        return [self.get_output_content(output) for output in outputs]
 
     # --- scored predict (generation PPL) ---
 
@@ -304,35 +358,16 @@ class VllmAsyncEngineVlmClient(VlmClient):
         sampling_params: SamplingParams | None = None,
         priority: int | None = None,
     ) -> ScoredOutput:
-        image = await aio_image_to_obj_list(image)
-
-        chat_prompt: str = self.tokenizer.apply_chat_template(
-            self.build_messages(prompt, len(image)),
-            tokenize=False,
-            add_generation_prompt=True,
+        raw_prompt, vllm_sp, generate_kwargs = await self._run_sync(
+            self._prepare_generate_request_sync,
+            image,
+            prompt,
+            sampling_params,
+            priority,
+            logprobs=True,
         )
-
-        vllm_sp = self.build_vllm_sampling_params(sampling_params)
-        vllm_sp.logprobs = 0
-
-        generate_kwargs = {}
-        if priority is not None:
-            generate_kwargs["priority"] = priority
-
-        vllm_prompt = await self._render_vllm_cmpl_input(_build_raw_vllm_prompt(chat_prompt, image))
-
-        last_output = None
-        async for output in self.vllm_async_llm.generate(
-            prompt=vllm_prompt,
-            sampling_params=vllm_sp,
-            request_id=str(uuid.uuid4()),
-            **generate_kwargs,
-        ):
-            last_output = output
-
-        if last_output is None:
-            raise ServerError("No output from the server.")
-
+        vllm_prompt = await self._render_vllm_cmpl_input(raw_prompt)
+        last_output = await self._generate_output(vllm_prompt, vllm_sp, generate_kwargs)
         return self._get_output_scored(last_output)
 
     async def aio_batch_predict_scored(
@@ -359,25 +394,24 @@ class VllmAsyncEngineVlmClient(VlmClient):
         if semaphore is None:
             semaphore = asyncio.Semaphore(self.max_concurrency)
 
-        async def predict_scored_with_semaphore(
-            image: ImageType,
-            prompt: str,
-            sp: SamplingParams | None,
-            prio: int | None,
-        ):
-            async with semaphore:
-                return await self.aio_predict_scored(
-                    image=image,
-                    prompt=prompt,
-                    sampling_params=sp,
-                    priority=prio,
-                )
-
-        return await gather_tasks(
-            tasks=[predict_scored_with_semaphore(*args) for args in zip(images, prompts, sampling_params, priority)],
+        prepared = await gather_tasks(
+            tasks=[
+                self._run_sync(self._prepare_generate_request_sync, *args, logprobs=True)
+                for args in zip(images, prompts, sampling_params, priority)
+            ],
+            use_tqdm=False,
+            tqdm_desc=None,
+        )
+        rendered_prompts = await self._render_vllm_cmpl_inputs([item[0] for item in prepared])
+        outputs = await gather_tasks(
+            tasks=[
+                self._generate_output(rendered_prompt, vllm_sp, generate_kwargs, semaphore)
+                for rendered_prompt, (_, vllm_sp, generate_kwargs) in zip(rendered_prompts, prepared)
+            ],
             use_tqdm=use_tqdm,
             tqdm_desc=tqdm_desc,
         )
+        return [self._get_output_scored(output) for output in outputs]
 
     # --- score (evaluation PPL / teacher forcing) ---
 
@@ -443,32 +477,16 @@ class VllmAsyncEngineVlmClient(VlmClient):
         sampling_params: SamplingParams | None = None,
         priority: int | None = None,
     ) -> ScoredOutput:
-        image_list = await aio_image_to_obj_list(image)
-
-        full_prompt, scored_token_count = self._build_score_prompt_pair(prompt, len(image_list), scored_text)
-
-        vllm_sp = self.build_vllm_sampling_params(sampling_params)
-        vllm_sp.prompt_logprobs = 0
-        vllm_sp.max_tokens = 1
-
-        generate_kwargs = {}
-        if priority is not None:
-            generate_kwargs["priority"] = priority
-
-        vllm_prompt = await self._render_vllm_cmpl_input(_build_raw_vllm_prompt(full_prompt, image_list))
-
-        last_output = None
-        async for output in self.vllm_async_llm.generate(
-            prompt=vllm_prompt,
-            sampling_params=vllm_sp,
-            request_id=str(uuid.uuid4()),
-            **generate_kwargs,
-        ):
-            last_output = output
-
-        if last_output is None:
-            raise ServerError("No output from the server.")
-
+        raw_prompt, vllm_sp, generate_kwargs, scored_token_count = await self._run_sync(
+            self._prepare_score_request_sync,
+            image,
+            scored_text,
+            prompt,
+            sampling_params,
+            priority,
+        )
+        vllm_prompt = await self._render_vllm_cmpl_input(raw_prompt)
+        last_output = await self._generate_output(vllm_prompt, vllm_sp, generate_kwargs)
         scored_output = self._extract_prompt_logprobs(last_output, scored_token_count)
         scored_output.text = scored_text
         return scored_output
@@ -499,25 +517,9 @@ class VllmAsyncEngineVlmClient(VlmClient):
         if semaphore is None:
             semaphore = asyncio.Semaphore(self.max_concurrency)
 
-        async def score_with_semaphore(
-            image: ImageType,
-            scored_text: str,
-            prompt: str,
-            sp: SamplingParams | None,
-            prio: int | None,
-        ):
-            async with semaphore:
-                return await self.aio_score(
-                    image=image,
-                    scored_text=scored_text,
-                    prompt=prompt,
-                    sampling_params=sp,
-                    priority=prio,
-                )
-
-        return await gather_tasks(
+        prepared = await gather_tasks(
             tasks=[
-                score_with_semaphore(*args)
+                self._run_sync(self._prepare_score_request_sync, *args)
                 for args in zip(
                     images,
                     scored_texts,
@@ -526,6 +528,21 @@ class VllmAsyncEngineVlmClient(VlmClient):
                     priority,
                 )
             ],
+            use_tqdm=False,
+            tqdm_desc=None,
+        )
+        rendered_prompts = await self._render_vllm_cmpl_inputs([item[0] for item in prepared])
+        outputs = await gather_tasks(
+            tasks=[
+                self._generate_output(rendered_prompt, vllm_sp, generate_kwargs, semaphore)
+                for rendered_prompt, (_, vllm_sp, generate_kwargs, _) in zip(rendered_prompts, prepared)
+            ],
             use_tqdm=use_tqdm,
             tqdm_desc=tqdm_desc,
         )
+        scored_outputs = []
+        for output, (_, _, _, scored_token_count), scored_text in zip(outputs, prepared, scored_texts):
+            scored_output = self._extract_prompt_logprobs(output, scored_token_count)
+            scored_output.text = scored_text
+            scored_outputs.append(scored_output)
+        return scored_outputs
